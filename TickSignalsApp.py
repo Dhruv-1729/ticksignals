@@ -5,147 +5,164 @@ import numpy as np
 from prophet import Prophet
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
-import sys
-import sqlalchemy 
+from sqlalchemy import create_engine, text
 from datetime import datetime, timedelta
 import re
-import os
 from scipy import stats
 
 # --- App Configuration ---
 st.set_page_config(page_title="TickSignals", layout="wide")
 
-# --- Initialize Neon Connection ---
-# This automatically and securely reads from your st.secrets
-# [connections.postgresql]
-try:
-    conn = st.connection("postgresql", type="sql")
-except Exception as e:
-    st.error(f"Failed to connect to the database. Please check secrets: {e}")
-    # Stop the app if DB connection fails
-    st.stop()
+# --- Database Connection ---
+def get_db_connection():
+    """Creates a SQLAlchemy engine for PostgreSQL connection"""
+    try:
+        db_url = st.secrets["connections"]["postgresql"]["url"]
+        engine = create_engine(db_url)
+        return engine
+    except Exception as e:
+        st.error(f"Database connection error: {e}")
+        return None
 
-
-# --- Helper Functions (MODIFIED FOR NEON) ---
+# --- Helper Functions ---
 
 @st.cache_data(ttl=3600)
 def get_stock_data_with_caching(ticker):
-    """
-    Fetches stock data, using the persistent Neon (PostgreSQL) database for caching.
-    """
-    sanitized_ticker = re.sub(r'[^a-zA-Z0-9_]', '', ticker).lower() # PostgreSQL prefers lowercase tables
+    """Fetches stock data using PostgreSQL database for caching."""
+    engine = get_db_connection()
+    if engine is None:
+        return pd.DataFrame(), ["Database connection failed"]
+    
+    # Sanitize ticker for table name (PostgreSQL is case-sensitive, use lowercase)
+    sanitized_ticker = re.sub(r'[^a-zA-Z0-9_]', '', ticker).lower()
+    table_name = f"stock_{sanitized_ticker}"
+    
     fetch_log = []
     
-    # Check if table exists and get the last date
     try:
-        # Use conn.run() for schema/metadata queries
-        existing_tables = conn.run(f"SELECT table_name FROM information_schema.tables WHERE table_name = '{sanitized_ticker}';")
-        
-        if existing_tables:
-            # Use conn.query() for pandas DataFrames
-            last_date_df = conn.query(f'SELECT MAX("Date") FROM "{sanitized_ticker}"')
-            last_date_str = last_date_df.iloc[0, 0]
-            start_date = (pd.to_datetime(last_date_str) + timedelta(days=1)).strftime('%Y-%m-%d')
-        else:
-            start_date = "2010-01-01"
+        with engine.connect() as conn:
+            # Check if table exists
+            check_table = text(f"""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = :table_name
+                )
+            """)
+            table_exists = conn.execute(check_table, {"table_name": table_name}).scalar()
             
+            if table_exists:
+                # Get the most recent date
+                last_date_query = text(f'SELECT MAX("Date") FROM {table_name}')
+                last_date_str = conn.execute(last_date_query).scalar()
+                
+                if last_date_str:
+                    start_date = (pd.to_datetime(last_date_str) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+                else:
+                    start_date = "2010-01-01"
+            else:
+                start_date = "2010-01-01"
+                # Create table if it doesn't exist
+                create_table = text(f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        "Date" DATE PRIMARY KEY,
+                        "Open" FLOAT,
+                        "High" FLOAT,
+                        "Low" FLOAT,
+                        "Close" FLOAT,
+                        "Volume" BIGINT
+                    )
+                """)
+                conn.execute(create_table)
+                conn.commit()
     except Exception as e:
-        fetch_log.append(f"DB read error for {ticker}: {e}. Defaulting to full history.")
+        fetch_log.append(f"Error checking existing data: {e}")
         start_date = "2010-01-01"
-
-    # Download new data if needed
+    
+    # Fetch new data if needed
     if start_date <= datetime.now().strftime('%Y-%m-%d'):
         fetch_log.append(f"Fetching new data for {ticker} from {start_date}...")
         new_data = yf.download(ticker, start=start_date, progress=False, auto_adjust=True)
+        
         if not new_data.empty:
             if isinstance(new_data.columns, pd.MultiIndex):
                 new_data.columns = new_data.columns.get_level_values(0)
-            
-            # Ensure column names are compatible with SQL
             new_data.rename(columns=str.capitalize, inplace=True)
             df_to_write = new_data.reset_index()
-            # Rename for consistency, ensure 'Date' is lowercase for some SQL variants if needed
             df_to_write.rename(columns={'index': 'Date'}, inplace=True)
             
-            # Write new data to the Neon database
+            # Write to PostgreSQL
             try:
-                # Use conn.write() to write a DataFrame to a table
-                # We use session.execute to use df.to_sql for more control
-                with conn.session() as s:
-                    df_to_write.to_sql(sanitized_ticker, 
-                                     con=s.bind, 
-                                     if_exists='append', 
-                                     index=False,
-                                     method='multi')
-                fetch_log.append(f"Successfully cached {len(df_to_write)} new rows for {ticker}.")
+                df_to_write.to_sql(table_name, engine, if_exists='append', index=False)
+                fetch_log.append(f"Added {len(df_to_write)} new records")
             except Exception as e:
-                fetch_log.append(f"Error writing to Neon DB for {ticker}: {e}")
+                fetch_log.append(f"Error writing data: {e}")
     else:
         fetch_log.append(f"Data for {ticker} is up to date.")
     
-    # Read all data for the ticker from the Neon DB
+    # Read all data
     try:
-        data = conn.query(f'SELECT * FROM "{sanitized_ticker}"')
-        date_col = next((col for col in data.columns if col.lower() == 'date'), 'Date')
-        
-        data[date_col] = pd.to_datetime(data[date_col])
-        data = data.set_index(date_col)
-        # Handle potential duplicates from overlapping fetches
-        data = data[~data.index.duplicated(keep='last')]
+        with engine.connect() as conn:
+            query = text(f'SELECT * FROM {table_name} ORDER BY "Date"')
+            data = pd.read_sql_query(query, conn)
+            
+            if 'Date' in data.columns:
+                data['Date'] = pd.to_datetime(data['Date'])
+                data = data.set_index('Date')
+            else:
+                return pd.DataFrame(), fetch_log
+                
     except Exception as e:
-        st.error(f"Error reading {ticker} data from Neon: {e}")
+        fetch_log.append(f"Error reading data: {e}")
         data = pd.DataFrame()
     
     return data, fetch_log
 
 def store_signals_in_db(ticker, signals_df):
-    """Stores newly generated signals in the Neon database."""
+    """Stores newly generated signals in the PostgreSQL database."""
+    engine = get_db_connection()
+    if engine is None:
+        return
     
-    # Create the all_signals table if it doesn't exist
     try:
-        with conn.session() as s:
-            s.execute(sqlalchemy.text('''
+        with engine.connect() as conn:
+            # Create signals table if it doesn't exist
+            create_table = text("""
                 CREATE TABLE IF NOT EXISTS all_signals (
-                    "Date" TEXT, 
-                    "Ticker" TEXT, 
-                    "Signal" TEXT, 
-                    "Price" REAL, 
+                    "Date" DATE,
+                    "Ticker" TEXT,
+                    "Signal" TEXT,
+                    "Price" FLOAT,
                     "Confidence_Pct" INTEGER,
                     PRIMARY KEY ("Date", "Ticker")
-                );
-            '''))
-            s.commit()
+                )
+            """)
+            conn.execute(create_table)
+            conn.commit()
+            
+            # Insert signals
+            for date, row in signals_df.iterrows():
+                signal_type = "Buy" if row['Signal'] == 2 else "Sell"
+                confidence = int(row.get('Confidence_%', 0))
+                
+                insert_query = text("""
+                    INSERT INTO all_signals ("Date", "Ticker", "Signal", "Price", "Confidence_Pct")
+                    VALUES (:date, :ticker, :signal, :price, :confidence)
+                    ON CONFLICT ("Date", "Ticker") 
+                    DO UPDATE SET "Signal" = :signal, "Price" = :price, "Confidence_Pct" = :confidence
+                """)
+                
+                conn.execute(insert_query, {
+                    "date": date.strftime('%Y-%m-%d'),
+                    "ticker": ticker,
+                    "signal": signal_type,
+                    "price": float(row['Close']),
+                    "confidence": confidence
+                })
+            
+            conn.commit()
+            
     except Exception as e:
-        st.warning(f"Could not create all_signals table: {e}")
-
-    # Prepare data for insertion
-    df_to_insert = signals_df.copy()
-    df_to_insert['Signal'] = df_to_insert['Signal'].apply(lambda x: "Buy" if x == 2 else "Sell")
-    df_to_insert['Confidence_Pct'] = df_to_insert['Confidence_%'].astype(int)
-    df_to_insert['Ticker'] = ticker
-    df_to_insert['Price'] = df_to_insert['Close']
-    df_to_insert['Date'] = df_to_insert.index.strftime('%Y-%m-%d')
-    
-    df_to_insert = df_to_insert[['Date', 'Ticker', 'Signal', 'Price', 'Confidence_Pct']]
-
-    # Use a SQL "INSERT ... ON CONFLICT DO UPDATE" to perform an "upsert"
-    # This avoids errors if we try to insert a duplicate key (Date, Ticker)
-    insert_sql = """
-    INSERT INTO all_signals ("Date", "Ticker", "Signal", "Price", "Confidence_Pct")
-    VALUES (:Date, :Ticker, :Signal, :Price, :Confidence_Pct)
-    ON CONFLICT ("Date", "Ticker") DO UPDATE SET
-        "Signal" = EXCLUDED."Signal",
-        "Price" = EXCLUDED."Price",
-        "Confidence_Pct" = EXCLUDED."Confidence_Pct";
-    """
-    
-    try:
-        with conn.session() as s:
-            for record in df_to_insert.to_dict('records'):
-                s.execute(sqlalchemy.text(insert_sql), record)
-            s.commit()
-    except Exception as e:
-        st.error(f"Error storing signals in Neon DB: {e}")
+        st.error(f"Error storing signals: {e}")
 
 def calculate_rsi(prices, period=14):
     """Calculate Relative Strength Index (RSI)"""
@@ -168,7 +185,6 @@ def calculate_atr(data, period=14):
 
 def is_trending_market(data, lookback=50):
     """Determine if market is trending or choppy"""
-    # ADX-like calculation
     high_low = data['High'] - data['Low']
     high_close = abs(data['High'] - data['Close'].shift())
     low_close = abs(data['Low'] - data['Close'].shift())
@@ -187,13 +203,10 @@ def is_trending_market(data, lookback=50):
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
     adx = dx.rolling(14).mean()
     
-    return adx > 20  # Trending if ADX > 20
+    return adx > 20
 
 def generate_enhanced_signals(data):
-    """
-    Enhanced signal generation with earlier entries and better exits.
-    Uses multiple confirmations and momentum filters.
-    """
+    """Enhanced signal generation with earlier entries and better exits."""
     data['Signal'] = 0
     data['SMA20'] = data['Close'].rolling(window=20).mean()
     data['SMA50'] = data['Close'].rolling(window=50).mean()
@@ -220,11 +233,11 @@ def generate_enhanced_signals(data):
     # Trend detection
     data['Is_Trending'] = is_trending_market(data)
     
-    # BUY CONDITIONS - Multiple confirmations needed
+    # BUY CONDITIONS
     buy_conditions = (
         (data['SMA20'] > data['SMA50']) & 
         (data['SMA20'].shift(1) <= data['SMA50'].shift(1)) &
-        (data['SMA50'] >= data['SMA200'] * 0.98) &  # Within 2% of SMA200
+        (data['SMA50'] >= data['SMA200'] * 0.98) &
         (data['RSI'] < 70) &
         (data['RSI'] > 30) &
         (data['MACD_Hist'] > data['MACD_Hist'].shift(1)) &
@@ -249,13 +262,11 @@ def generate_enhanced_signals(data):
     return data
 
 def calculate_confidence_score(forecast_data, signal_type):
-    """
-    Calculate confidence score (0-100%) based on technical indicators.
-    """
+    """Calculate confidence score (0-100%) based on technical indicators."""
     score = 0
     max_score = 0
     
-    # Days to crossover scoring (closer = better, but not too close)
+    # Days to crossover scoring
     max_score += 20
     days = abs(forecast_data['days_to_crossover'])
     if 3 <= days <= 8: score += 20
@@ -316,7 +327,7 @@ def calculate_confidence_score(forecast_data, signal_type):
         elif -8 <= price_roc <= 8: score += 5
     
     confidence_pct = int((score / max_score) * 100)
-    return min(100, max(0, confidence_pct)) 
+    return min(100, max(0, confidence_pct))
 
 def calculate_forecast_metrics(data):
     """Advanced forecasting for predicting buy AND sell signals with confidence scoring."""
@@ -399,9 +410,7 @@ def calculate_forecast_metrics(data):
     return forecast
 
 def calculate_signal_confidence(data, signal_index):
-    """
-    Enhanced confidence calculation based on signal quality.
-    """
+    """Enhanced confidence calculation based on signal quality."""
     score = 0
     max_score = 0
     
@@ -414,7 +423,7 @@ def calculate_signal_confidence(data, signal_index):
     price_roc = data['Price_ROC'].iloc[signal_index]
     volume_ratio = data['Volume_Ratio'].iloc[signal_index] if 'Volume_Ratio' in data.columns else 1
     
-    # Gap size at crossover (20 points) - tighter is better
+    # Gap size at crossover
     max_score += 20
     gap_pct = abs((sma20 - sma50) / current_price) * 100
     if gap_pct < 0.3: score += 20
@@ -422,7 +431,7 @@ def calculate_signal_confidence(data, signal_index):
     elif gap_pct < 1.5: score += 10
     elif gap_pct < 2.5: score += 5
     
-    # RSI positioning (25 points)
+    # RSI positioning
     max_score += 25
     if signal_type == 2:  # BUY
         if 35 <= rsi <= 55: score += 25
@@ -433,7 +442,7 @@ def calculate_signal_confidence(data, signal_index):
         elif 40 <= rsi <= 70: score += 18
         elif 35 <= rsi <= 75: score += 10
     
-    # MACD alignment (20 points)
+    # MACD alignment
     max_score += 20
     if signal_type == 2:  # BUY
         if macd_hist > 0: score += 20
@@ -444,14 +453,14 @@ def calculate_signal_confidence(data, signal_index):
         elif macd_hist < 0.3: score += 12
         elif macd_hist < 0.8: score += 6
     
-    # Volume strength (15 points)
+    # Volume strength
     max_score += 15
     if volume_ratio > 1.5: score += 15
     elif volume_ratio > 1.2: score += 12
     elif volume_ratio > 0.9: score += 8
     elif volume_ratio > 0.7: score += 4
     
-    # Momentum alignment (20 points)
+    # Momentum alignment
     max_score += 20
     if signal_type == 2:  # BUY
         if price_roc > 2: score += 20
@@ -465,7 +474,7 @@ def calculate_signal_confidence(data, signal_index):
     confidence_pct = int((score / max_score) * 100)
     return confidence_pct
 
-# --- New Streamlit Helper Functions ---
+# --- Streamlit Helper Functions ---
 
 def format_large_number(num):
     """Formats large numbers into M, B, T strings."""
@@ -486,7 +495,6 @@ def get_stock_info(ticker):
         stock = yf.Ticker(ticker)
         info = stock.info
         
-        # Use fastInfo for more reliable last price, fallback to regularMarketPrice
         price = info.get('currentPrice', info.get('regularMarketPrice', 'N/A'))
         
         return {
@@ -502,60 +510,23 @@ def get_stock_info(ticker):
         }
 
 @st.cache_resource
-def load_csv_data(file_name, from_db=False):
-    """
-    Loads data. If from_db=True, loads from Neon DB.
-    Otherwise, attempts to load from a local CSV (for uploaded files).
-    """
-    if from_db:
-        try:
-            # Note: PostgreSQL table names are case-sensitive if quoted.
-            # Assuming we standardize on lowercase for these tables.
-            db_table_name = file_name.replace('.csv', '').lower()
-            if db_table_name == "latest_signals":
-                # Special query for latest_signals
-                query = """
-                SELECT t1."Date", t1."Ticker", t1."Signal", t1."Price", t1."Confidence_Pct" as "Confidence_%"
-                FROM all_signals t1
-                INNER JOIN (
-                    SELECT "Ticker", MAX("Date") as "MaxDate"
-                    FROM all_signals
-                    GROUP BY "Ticker"
-                ) t2 ON t1."Ticker" = t2."Ticker" AND t1."Date" = t2."MaxDate"
-                ORDER BY t1."Confidence_Pct" DESC, t1."Date" DESC;
-                """
-                df = conn.query(query)
-            else:
-                # Standard table query
-                df = conn.query(f'SELECT * FROM "{db_table_name}"')
-                
-            if 'Date' in df.columns:
-                df['Date'] = pd.to_datetime(df['Date'])
-            return df
-        except Exception as e:
-            st.warning(f"Could not load data from database table '{db_table_name}': {e}")
-            return None
-    else:
-        # Original CSV loading logic (for user uploads)
-        try:
-            df = pd.read_csv(file_name)
-            if 'Date' in df.columns:
-                df['Date'] = pd.to_datetime(df['Date'])
-            return df
-        except FileNotFoundError:
-            return None
-        except Exception as e:
-            st.error(f"Error loading {file_name}: {e}")
-            return None
+def load_csv_data(file_name):
+    """Loads a CSV file, handling FileNotFoundError."""
+    try:
+        df = pd.read_csv(file_name)
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'])
+        return df
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        st.error(f"Error loading {file_name}: {e}")
+        return None
 
 # --- Modified Core Functions for Streamlit ---
 
 def generate_chart_for_ticker_mod(ticker, show_forecast=False):
-    """
-    Generates chart, performance, and forecast strings for Streamlit.
-    MODIFIED: Returns fig, perf_summary, forecast_summary. Does NOT call fig.show().
-    Uses Neon DB.
-    """
+    """Generates chart, performance, and forecast strings for Streamlit."""
     data, fetch_log = get_stock_data_with_caching(ticker)
     if data.empty:
         st.error(f"ERROR: No data found for ticker '{ticker}'")
@@ -645,7 +616,6 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
         except Exception as e:
             st.warning(f"Could not generate Prophet forecast: {e}")
 
-    # --- Capture Output as Strings ---
     forecast_summary = "No active forecast."
     if show_forecast and forecast_data and forecast_data['signal'] != 'NEUTRAL':
         forecast_summary = (
@@ -679,7 +649,6 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
         f"Outperformance: {strategy_return - bh_return:+.2f}%\n"
         f"Total Transactions: {len(transaction_log)}"
     )
-    # --- End Capture ---
 
     # Create 3-row chart
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
@@ -771,7 +740,7 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
                       font=dict(size=10), align="left", height=20)
         ), row=3, col=1)
     
-    chart_title = f'{ticker} Analysis: Enhanced MA Strategy | Strategy: ${final_strategy_value:,.0f} vs Buy&Hold: ${final_bh_value:,.0f}'
+    chart_title = f'{ticker} Analysis'
     fig.update_layout(
         title=dict(text=chart_title, x=0.5, xanchor='center', font=dict(size=13)),
         legend=dict(orientation="v", yanchor="top", y=0.99, xanchor="right", x=0.99, 
@@ -785,7 +754,7 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
     )
     fig.update_xaxes(rangeselector=dict(buttons=list([
         dict(count=1, label="1m", step="month", stepmode="backward"),
-        dict(count=3, label="3m", step="month", stepstepmode="backward"),
+        dict(count=3, label="3m", step="month", stepmode="backward"),
         dict(count=6, label="6m", step="month", stepmode="backward"),
         dict(count=1, label="YTD", step="year", stepmode="todate"),
         dict(count=1, label="1y", step="year", stepmode="backward"),
@@ -799,10 +768,7 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
 
 
 def process_all_tickers_mod(ticker_list, logger_callback):
-    """
-    Mass processing mode.
-    MODIFIED: Uses Neon DB and returns DataFrame.
-    """
+    """Mass processing mode."""
     logger_callback(f"Processing {len(ticker_list)} tickers...")
     
     for i, ticker in enumerate(ticker_list, 1):
@@ -843,28 +809,39 @@ def process_all_tickers_mod(ticker_list, logger_callback):
             store_signals_in_db(ticker, signals_to_store)
             logger_callback(f"Stored {len(signals_to_store)} signals for {ticker}")
     
-    # Export latest signals from Neon DB
+    # Export latest signals
     logger_callback("\n--- Exporting Latest Signals ---")
-    latest_signals_df = load_csv_data("latest_signals.csv", from_db=True)
+    engine = get_db_connection()
+    latest_signals_df = pd.DataFrame()
     
-    if latest_signals_df is not None and not latest_signals_df.empty:
-        # Save a local copy for download
-        output_csv = 'latest_signals.csv'
-        latest_signals_df.to_csv(output_csv, index=False)
-        logger_callback(f"Exported latest signals to '{output_csv}' for download.")
-    else:
-        logger_callback("No latest signals found in database.")
-        latest_signals_df = pd.DataFrame()
+    if engine:
+        try:
+            with engine.connect() as conn:
+                query = text("""
+                    SELECT t1."Date", t1."Ticker", t1."Signal", t1."Price", t1."Confidence_Pct" as "Confidence_%"
+                    FROM all_signals t1
+                    INNER JOIN (
+                        SELECT "Ticker", MAX("Date") as "MaxDate"
+                        FROM all_signals
+                        GROUP BY "Ticker"
+                    ) t2 ON t1."Ticker" = t2."Ticker" AND t1."Date" = t2."MaxDate"
+                    ORDER BY t1."Confidence_Pct" DESC, t1."Date" DESC
+                """)
+                latest_signals_df = pd.read_sql_query(query, conn)
+                
+                if not latest_signals_df.empty:
+                    output_csv = 'latest_signals.csv'
+                    latest_signals_df.to_csv(output_csv, index=False)
+                    logger_callback(f"Exported latest signals to '{output_csv}'")
+        except Exception as e:
+            logger_callback(f"Error exporting signals: {e}")
     
     logger_callback("\nMass processing complete!")
     return latest_signals_df
 
 
 def forecast_mode_mod(ticker_list, logger_callback):
-    """
-    Forecast mode.
-    MODIFIED: Uses Neon DB and returns DataFrame.
-    """
+    """Forecast mode."""
     logger_callback(f"Analyzing {len(ticker_list)} tickers for forecasts...\n")
     
     forecasts = []
@@ -895,6 +872,8 @@ def forecast_mode_mod(ticker_list, logger_callback):
     progress_bar.empty()
     
     if forecasts:
+        logger_callback("\nProcessing forecasts...")
+        
         forecast_df = pd.DataFrame(forecasts)
         
         # Sort by priority
@@ -910,48 +889,35 @@ def forecast_mode_mod(ticker_list, logger_callback):
                             'Gap_%', 'RSI', 'MACD_Histogram', 'Price_ROC_%', 'Volume_Trend_%', 'Convergence_Rate']
         
         output_df['Date'] = pd.to_datetime(output_df['Date']).dt.strftime('%Y-%m-%d')
-        # Rounding for display
         output_df['Days_To_Crossover'] = output_df['Days_To_Crossover'].round(1)
         output_df['Current_Price'] = output_df['Current_Price'].round(2)
         
-        # Save to Neon DB
-        try:
-            with conn.session() as s:
-                output_df.to_sql("forecast_signals", 
-                                 con=s.bind, 
-                                 if_exists='replace', # Replace old forecasts
-                                 index=False,
-                                 method='multi')
-            logger_callback(f"Forecast complete! {len(output_df)} opportunities found and saved to DB.")
-        except Exception as e:
-            logger_callback(f"Error saving forecasts to Neon DB: {e}")
-
-        # Save a local copy for download
         output_file = 'forecast_signals.csv'
         output_df.to_csv(output_file, index=False)
         
+        logger_callback(f"Forecast complete! {len(output_df)} opportunities found.")
         return output_df
     else:
         logger_callback("\nNo forecast signals found.")
         return pd.DataFrame()
 
 
-# --- Streamlit UI (Modified to load from DB) ---
+
 
 st.sidebar.title("TickSignals")
 app_mode = st.sidebar.radio(
-    "Navigation",
-    ["Analyzer", "Forecast Signals", "Trade Signals"]
+    "Tabs",
+    ["Ticker Analyzer", "Forecast Signals History", "Trade Signals History"]
 )
 
-if app_mode == "Analyzer":
-    st.title("Signal Analyzer")
+if app_mode == "Ticker Analyzer":
+    st.title("Ticker Analyzer")
     
     single_tab, mass_tab, forecast_tab = st.tabs(["Single Ticker", "Mass Run", "Forecast Run"])
 
     with single_tab:
         st.header("Single Ticker Analysis")
-        ticker_input = st.text_input("Enter Ticker Symbol", "SPY").upper()
+        ticker_input = st.text_input("Enter Ticker Symbol", "").upper()
         
         if st.button("Run Analysis"):
             if not ticker_input:
@@ -978,23 +944,21 @@ if app_mode == "Analyzer":
                             st.subheader("Performance Summary")
                             st.text(perf_summary)
                         with col_forecast:
-                            st.subheader("Forecast Summary")
+                            st.subheader("Forecast Analysis")
                             st.text(forecast_summary)
                     else:
                         st.error("Could not generate chart for this ticker.")
 
     with mass_tab:
         st.header("Mass Run - All Tickers")
-        st.write("Process a list of tickers to generate and store trade signals in the persistent database.")
+        st.write("Process a list of tickers to generate and store trade signals.")
         
-        # Option to upload a new CSV
         uploaded_file = st.file_uploader("Upload Ticker CSV (Optional, uses 'vanguard.csv' if not provided)", type="csv")
         
         if st.button("Run Mass Signal Analysis"):
             ticker_list = []
             if uploaded_file is not None:
                 try:
-                    # Use the uploaded file's in-memory representation
                     ticker_df = pd.read_csv(uploaded_file)
                     ticker_list = ticker_df.iloc[:, 0].tolist()
                     st.info(f"Using {len(ticker_list)} tickers from uploaded file.")
@@ -1002,7 +966,7 @@ if app_mode == "Analyzer":
                     st.error(f"Error reading uploaded file: {e}")
             else:
                 try:
-                    ticker_df = pd.read_csv('vanguard.csv') # Default file
+                    ticker_df = pd.read_csv('vanguard.csv')
                     ticker_list = ticker_df.iloc[:, 0].tolist()
                     st.info(f"Using {len(ticker_list)} tickers from default 'vanguard.csv'.")
                 except FileNotFoundError:
@@ -1015,26 +979,24 @@ if app_mode == "Analyzer":
                 def mass_logger(message):
                     log_area.info(message)
 
-                with st.spinner("Processing all tickers... This may take a long time."):
+                with st.spinner("Processing all tickers... This may take a moment."):
                     latest_signals_df = process_all_tickers_mod(ticker_list, mass_logger)
                 
                 st.success("Mass Run Complete!")
                 st.dataframe(latest_signals_df)
                 
-                if not latest_signals_df.empty:
-                    st.download_button(
-                        label="Download latest_signals.csv",
-                        data=latest_signals_df.to_csv(index=False).encode('utf-8'),
-                        file_name="latest_signals.csv",
-                        mime="text/csv"
-                    )
+                st.download_button(
+                    label="Download latest_signals.csv",
+                    data=latest_signals_df.to_csv(index=False).encode('utf-8'),
+                    file_name="latest_signals.csv",
+                    mime="text/csv"
+                )
 
     with forecast_tab:
         st.header("Predictive Forecast Run")
-        st.write("Analyze all tickers for potential *upcoming* buy/sell signals. Results are saved to the persistent database.")
+        st.write("Analyze all tickers for potential *upcoming* buy/sell signals.")
         
-        # Option to upload a new CSV
-        uploaded_file_forecast = st.file_uploader("Upload Ticker CSV (Optional, uses 'vanguard.csv' if not provided)", type="csv", key="forecast_uploader")
+        uploaded_file_forecast = st.file_uploader("Upload Ticker CSV (Optional, uses Vanguard ETF 1500 if not provided)", type="csv", key="forecast_uploader")
 
         if st.button("Run Forecast Analysis"):
             ticker_list_forecast = []
@@ -1047,7 +1009,7 @@ if app_mode == "Analyzer":
                     st.error(f"Error reading uploaded file: {e}")
             else:
                 try:
-                    ticker_df = pd.read_csv('vanguard.csv') # Default file
+                    ticker_df = pd.read_csv('vanguard.csv')
                     ticker_list_forecast = ticker_df.iloc[:, 0].tolist()
                     st.info(f"Using {len(ticker_list_forecast)} tickers from default 'vanguard.csv'.")
                 except FileNotFoundError:
@@ -1066,50 +1028,44 @@ if app_mode == "Analyzer":
                 st.success("Forecast Run Complete!")
                 st.dataframe(forecast_df)
 
-                if not forecast_df.empty:
-                    st.download_button(
-                        label="Download forecast_signals.csv",
-                        data=forecast_df.to_csv(index=False).encode('utf-8'),
-                        file_name="forecast_signals.csv",
-                        mime="text/csv"
-                    )
+                st.download_button(
+                    label="Download forecast_signals.csv",
+                    data=forecast_df.to_csv(index=False).encode('utf-8'),
+                    file_name="forecast_signals.csv",
+                    mime="text/csv"
+                )
 
-elif app_mode == "Forecast Signals":
-    st.title("Forecast Signals")
-    st.info("This table shows predictive signals from the persistent database, sorted by date (newest first).")
-    st.write("Run a 'Forecast Run' from the 'Analyzer' tab to generate or update this data.")
+elif app_mode == "Forecast Signals History":
+    st.title("Forecast Signals History")
 
-    # Load from the 'forecast_signals' table in Neon DB
-    forecast_data = load_csv_data("forecast_signals.csv", from_db=True)
+    forecast_data = load_csv_data("forecast_signals.csv")
     
     if forecast_data is not None:
         if not forecast_data.empty:
             if 'Date' in forecast_data.columns:
+                forecast_data['Date'] = pd.to_datetime(forecast_data['Date'])
                 st.dataframe(forecast_data.sort_values(by='Date', ascending=False), use_container_width=True)
             else:
-                st.warning("Forecast data is missing the 'Date' column for sorting.")
+                st.warning("Forecast file is missing the 'Date' column for sorting.")
                 st.dataframe(forecast_data, use_container_width=True)
         else:
             st.warning("No forecast data found. Please run a 'Forecast Run' from the 'Analyzer' tab.")
     else:
-        st.warning("No 'forecast_signals' table found in database. Please run a 'Forecast Run' from the 'Analyzer' tab to generate it.")
+        st.warning("No 'forecast_signals.csv' file found. Please run a 'Forecast Run' from the 'Analyzer' tab to generate it.")
 
-elif app_mode == "Trade Signals":
-    st.title("Trade Signals")
-    st.info("This table shows the latest confirmed trade signal for each ticker from the persistent database, sorted by date (newest first).")
-    st.write("Run a 'Mass Run' from the 'Analyzer' tab to generate or update this data.")
-    
-    # Load from the 'all_signals' table in Neon DB
-    signal_data = load_csv_data("latest_signals.csv", from_db=True)
+elif app_mode == "Trade Signals History":
+    st.title("Trade Signals History")    
+    signal_data = load_csv_data("latest_signals.csv")
     
     if signal_data is not None:
         if not signal_data.empty:
             if 'Date' in signal_data.columns:
+                signal_data['Date'] = pd.to_datetime(signal_data['Date'])
                 st.dataframe(signal_data.sort_values(by='Date', ascending=False), use_container_width=True)
             else:
-                st.warning("Signal data is missing the 'Date' column for sorting.")
+                st.warning("Signal file is missing the 'Date' column for sorting.")
                 st.dataframe(signal_data, use_container_width=True)
         else:
             st.warning("No signal data found. Please run a 'Mass Run' from the 'Analyzer' tab.")
     else:
-        st.warning("No 'all_signals' table found in database. Please run a 'Mass Run' from the 'Analyzer' tab to generate it.")
+        st.warning("No 'latest_signals.csv' file found. Please run a 'Mass Run' from the 'Analyzer' tab to generate it.")
