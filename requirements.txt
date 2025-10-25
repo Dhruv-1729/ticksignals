@@ -11,3 +11,4 @@ disutils
 scipy
 streamlit
 numpy
+sqlalchemy
