@@ -12,3 +12,4 @@ scipy
 streamlit
 numpy
 sqlalchemy
+psycopg2-binary
