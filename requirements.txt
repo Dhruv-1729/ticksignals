@@ -1,0 +1,13 @@
+yfinance 
+pandas 
+prophet 
+matplotlib
+plotly
+nbformat
+pandas-ta
+tqdm
+pandas_datareader
+disutils
+scipy
+streamlit
+numpy
