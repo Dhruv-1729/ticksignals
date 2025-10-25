@@ -885,7 +885,7 @@ if app_mode == "Ticker Analyzer":
         st.write("Process a list of tickers to generate and store trade signals.")
         
         # Option to upload a new CSV
-        uploaded_file = st.file_uploader("Upload Ticker CSV (Optional, uses 'vanguard.csv' if not provided)", type="csv")
+        uploaded_file = st.file_uploader("Upload Ticker CSV (Uses Vanguard ETF 1500 if not provided)", type="csv")
         
         if st.button("Run Mass Signal Analysis"):
             ticker_list = []
