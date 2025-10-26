@@ -113,6 +113,30 @@ def get_analytics_data():
     
     try:
         with engine.connect() as conn:
+            # Create tables if they don't exist
+            create_visits_table = text("""
+                CREATE TABLE IF NOT EXISTS analytics_visits (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    session_id TEXT,
+                    page_count INTEGER
+                )
+            """)
+            conn.execute(create_visits_table)
+            
+            create_searches_table = text("""
+                CREATE TABLE IF NOT EXISTS analytics_searches (
+                    id SERIAL PRIMARY KEY,
+                    ticker TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    session_id TEXT
+                )
+            """)
+            conn.execute(create_searches_table)
+            conn.commit()
+            
+
+        with engine.connect() as conn:
             # Total visits
             visits_query = text("SELECT COUNT(*) FROM analytics_visits")
             total_visits = conn.execute(visits_query).scalar() or 0
@@ -846,12 +870,36 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
 
     # Row 2: Signals table
     if not signals_df.empty:
-        table_df = signals_df[['Date', 'Type', 'Price']].tail(30)
+        # Don't limit to 30, show all signals
+        table_df = signals_df[['Date', 'Type', 'Price']].copy()
+        
+        # Color code the cells based on signal type
+        cell_colors = []
+        for signal_type in table_df['Type']:
+            if 'Buy' in signal_type and 'Prediction' not in signal_type:
+                cell_colors.append('lightgreen')
+            elif 'Sell' in signal_type and 'Prediction' not in signal_type:
+                cell_colors.append('lightcoral')
+            elif 'Buy (Prediction)' in signal_type:
+                cell_colors.append('lightyellow')
+            else:  # Sell (Prediction)
+                cell_colors.append('lightsalmon')
+        
         fig.add_trace(go.Table(
-            header=dict(values=['Date', 'Signal Type', 'Price'], 
-                       font=dict(size=12), align="left", fill_color='lightgray'),
-            cells=dict(values=[table_df['Date'], table_df['Type'], table_df['Price']], 
-                      font=dict(size=11), align="left", height=25)
+            header=dict(
+                values=['Date', 'Signal Type', 'Price'], 
+                font=dict(size=13, color='white'),
+                align="left",
+                fill_color='#1f77b4',
+                height=30
+            ),
+            cells=dict(
+                values=[table_df['Date'], table_df['Type'], table_df['Price']], 
+                font=dict(size=12),
+                align="left",
+                height=28,
+                fill_color=[['white']*len(table_df), cell_colors, ['white']*len(table_df)]
+            )
         ), row=2, col=1)
     
     chart_title = f'{ticker} Analysis'
@@ -863,7 +911,7 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
         xaxis_rangeslider_visible=False,
         yaxis1_title="Price (USD)",
         dragmode='pan',
-        height=900
+        height=1200
     )
     
     # Enable mobile-friendly zoom and pan
