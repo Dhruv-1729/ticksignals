@@ -1024,22 +1024,35 @@ def forecast_mode_mod(ticker_list, logger_callback):
 # --- Streamlit UI ---
 
 # Admin Mode Toggle
-col_admin, col_spacer = st.sidebar.columns([1, 2])
-with col_admin:
-    if st.button("🔐" if not st.session_state.admin_mode else "🔓"):
-        if not st.session_state.admin_mode:
-            password = st.text_input("Enter Password:", type="password", key="admin_password")
-            if password == "dhruv10":
-                st.session_state.admin_mode = True
-                st.rerun()
-            elif password:
-                st.error("Incorrect password")
-        else:
-            st.session_state.admin_mode = False
-            st.rerun()
+if 'show_admin_login' not in st.session_state:
+    st.session_state.show_admin_login = False
 
-if st.session_state.admin_mode:
+if not st.session_state.admin_mode:
+    if st.sidebar.button("🔐"):
+        st.session_state.show_admin_login = not st.session_state.show_admin_login
+    
+    if st.session_state.show_admin_login:
+        with st.sidebar:
+            admin_password = st.text_input("Enter Password:", type="password", key="admin_password_input")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Login", use_container_width=True):
+                    if admin_password == "dhruv10":
+                        st.session_state.admin_mode = True
+                        st.session_state.show_admin_login = False
+                        st.success("Logged in!")
+                        st.rerun()
+                    else:
+                        st.error("Incorrect password")
+            with col2:
+                if st.button("Cancel", use_container_width=True):
+                    st.session_state.show_admin_login = False
+                    st.rerun()
+else:
     st.sidebar.success("Admin Mode Active")
+    if st.sidebar.button("🔓 Logout"):
+        st.session_state.admin_mode = False
+        st.rerun()
 
 st.sidebar.title("TickSignals")
 
