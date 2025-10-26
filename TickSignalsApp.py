@@ -9,9 +9,21 @@ from sqlalchemy import create_engine, text
 from datetime import datetime, timedelta
 import re
 from scipy import stats
+import hashlib
 
 # --- App Configuration ---
 st.set_page_config(page_title="TickSignals", layout="wide")
+
+# --- Initialize Session State ---
+if 'admin_mode' not in st.session_state:
+    st.session_state.admin_mode = False
+if 'page_visits' not in st.session_state:
+    st.session_state.page_visits = 0
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = hashlib.md5(str(datetime.now().timestamp()).encode()).hexdigest()[:8]
+
+# Increment page visits
+st.session_state.page_visits += 1
 
 # --- Database Connection ---
 def get_db_connection():
@@ -24,6 +36,148 @@ def get_db_connection():
         st.error(f"Database connection error: {e}")
         return None
 
+# --- Analytics Functions ---
+def log_ticker_search(ticker):
+    """Log ticker search to database"""
+    engine = get_db_connection()
+    if engine is None:
+        return
+    
+    try:
+        with engine.connect() as conn:
+            # Create analytics table if it doesn't exist
+            create_table = text("""
+                CREATE TABLE IF NOT EXISTS analytics_searches (
+                    id SERIAL PRIMARY KEY,
+                    ticker TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    session_id TEXT
+                )
+            """)
+            conn.execute(create_table)
+            conn.commit()
+            
+            # Insert search log
+            insert_query = text("""
+                INSERT INTO analytics_searches (ticker, session_id)
+                VALUES (:ticker, :session_id)
+            """)
+            conn.execute(insert_query, {
+                "ticker": ticker,
+                "session_id": st.session_state.session_id
+            })
+            conn.commit()
+    except Exception as e:
+        pass  # Silently fail to not disrupt user experience
+
+def log_page_visit():
+    """Log page visit to database"""
+    engine = get_db_connection()
+    if engine is None:
+        return
+    
+    try:
+        with engine.connect() as conn:
+            # Create visits table if it doesn't exist
+            create_table = text("""
+                CREATE TABLE IF NOT EXISTS analytics_visits (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    session_id TEXT,
+                    page_count INTEGER
+                )
+            """)
+            conn.execute(create_table)
+            conn.commit()
+            
+            # Insert visit log
+            insert_query = text("""
+                INSERT INTO analytics_visits (session_id, page_count)
+                VALUES (:session_id, :page_count)
+            """)
+            conn.execute(insert_query, {
+                "session_id": st.session_state.session_id,
+                "page_count": st.session_state.page_visits
+            })
+            conn.commit()
+    except Exception as e:
+        pass
+
+def get_analytics_data():
+    """Retrieve analytics data from database"""
+    engine = get_db_connection()
+    if engine is None:
+        return None
+    
+    analytics = {}
+    
+    try:
+        with engine.connect() as conn:
+            # Total visits
+            visits_query = text("SELECT COUNT(*) FROM analytics_visits")
+            total_visits = conn.execute(visits_query).scalar() or 0
+            analytics['total_visits'] = total_visits
+            
+            # Unique sessions
+            sessions_query = text("SELECT COUNT(DISTINCT session_id) FROM analytics_visits")
+            unique_sessions = conn.execute(sessions_query).scalar() or 0
+            analytics['unique_sessions'] = unique_sessions
+            
+            # Current active users (last 5 minutes)
+            active_query = text("""
+                SELECT COUNT(DISTINCT session_id) 
+                FROM analytics_visits 
+                WHERE timestamp > NOW() - INTERVAL '5 minutes'
+            """)
+            active_users = conn.execute(active_query).scalar() or 0
+            analytics['active_users'] = active_users
+            
+            # Most searched tickers
+            popular_query = text("""
+                SELECT ticker, COUNT(*) as search_count 
+                FROM analytics_searches 
+                GROUP BY ticker 
+                ORDER BY search_count DESC 
+                LIMIT 10
+            """)
+            popular_tickers = pd.read_sql_query(popular_query, conn)
+            analytics['popular_tickers'] = popular_tickers
+            
+            # Recent searches
+            recent_query = text("""
+                SELECT ticker, timestamp, session_id 
+                FROM analytics_searches 
+                ORDER BY timestamp DESC 
+                LIMIT 20
+            """)
+            recent_searches = pd.read_sql_query(recent_query, conn)
+            analytics['recent_searches'] = recent_searches
+            
+            # Total searches
+            total_searches_query = text("SELECT COUNT(*) FROM analytics_searches")
+            total_searches = conn.execute(total_searches_query).scalar() or 0
+            analytics['total_searches'] = total_searches
+            
+            # Visits over time (last 7 days)
+            visits_time_query = text("""
+                SELECT DATE(timestamp) as date, COUNT(*) as visits
+                FROM analytics_visits
+                WHERE timestamp > NOW() - INTERVAL '30 days'
+                GROUP BY DATE(timestamp)
+                ORDER BY date
+            """)
+            visits_over_time = pd.read_sql_query(visits_time_query, conn)
+            analytics['visits_over_time'] = visits_over_time
+            
+    except Exception as e:
+        st.error(f"Error fetching analytics: {e}")
+        return None
+    
+    return analytics
+
+# Log this page visit
+log_page_visit()
+
 # --- Helper Functions ---
 
 @st.cache_data(ttl=3600)
@@ -33,7 +187,6 @@ def get_stock_data_with_caching(ticker):
     if engine is None:
         return pd.DataFrame(), ["Database connection failed"]
     
-    # Sanitize ticker for table name (PostgreSQL is case-sensitive, use lowercase)
     sanitized_ticker = re.sub(r'[^a-zA-Z0-9_]', '', ticker).lower()
     table_name = f"stock_{sanitized_ticker}"
     
@@ -41,7 +194,6 @@ def get_stock_data_with_caching(ticker):
     
     try:
         with engine.connect() as conn:
-            # Check if table exists
             check_table = text(f"""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables 
@@ -51,7 +203,6 @@ def get_stock_data_with_caching(ticker):
             table_exists = conn.execute(check_table, {"table_name": table_name}).scalar()
             
             if table_exists:
-                # Get the most recent date
                 last_date_query = text(f'SELECT MAX("Date") FROM {table_name}')
                 last_date_str = conn.execute(last_date_query).scalar()
                 
@@ -61,7 +212,6 @@ def get_stock_data_with_caching(ticker):
                     start_date = "2010-01-01"
             else:
                 start_date = "2010-01-01"
-                # Create table if it doesn't exist
                 create_table = text(f"""
                     CREATE TABLE IF NOT EXISTS {table_name} (
                         "Date" DATE PRIMARY KEY,
@@ -78,7 +228,6 @@ def get_stock_data_with_caching(ticker):
         fetch_log.append(f"Error checking existing data: {e}")
         start_date = "2010-01-01"
     
-    # Fetch new data if needed
     if start_date <= datetime.now().strftime('%Y-%m-%d'):
         fetch_log.append(f"Fetching new data for {ticker} from {start_date}...")
         new_data = yf.download(ticker, start=start_date, progress=False, auto_adjust=True)
@@ -90,7 +239,6 @@ def get_stock_data_with_caching(ticker):
             df_to_write = new_data.reset_index()
             df_to_write.rename(columns={'index': 'Date'}, inplace=True)
             
-            # Write to PostgreSQL
             try:
                 df_to_write.to_sql(table_name, engine, if_exists='append', index=False)
                 fetch_log.append(f"Added {len(df_to_write)} new records")
@@ -99,7 +247,6 @@ def get_stock_data_with_caching(ticker):
     else:
         fetch_log.append(f"Data for {ticker} is up to date.")
     
-    # Read all data
     try:
         with engine.connect() as conn:
             query = text(f'SELECT * FROM {table_name} ORDER BY "Date"')
@@ -125,7 +272,6 @@ def store_signals_in_db(ticker, signals_df):
     
     try:
         with engine.connect() as conn:
-            # Create signals table if it doesn't exist
             create_table = text("""
                 CREATE TABLE IF NOT EXISTS all_signals (
                     "Date" DATE,
@@ -139,7 +285,6 @@ def store_signals_in_db(ticker, signals_df):
             conn.execute(create_table)
             conn.commit()
             
-            # Insert signals
             for date, row in signals_df.iterrows():
                 signal_type = "Buy" if row['Signal'] == 2 else "Sell"
                 confidence = int(row.get('Confidence_%', 0))
@@ -213,27 +358,21 @@ def generate_enhanced_signals(data):
     data['SMA200'] = data['Close'].rolling(window=200).mean()
     data['RSI'] = calculate_rsi(data['Close'], period=14)
     
-    # MACD
     exp12 = data['Close'].ewm(span=12, adjust=False).mean()
     exp26 = data['Close'].ewm(span=26, adjust=False).mean()
     data['MACD'] = exp12 - exp26
     data['MACD_Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
     data['MACD_Hist'] = data['MACD'] - data['MACD_Signal']
     
-    # Volume
     if 'Volume' in data.columns:
         data['Volume_MA'] = data['Volume'].rolling(window=20).mean()
         data['Volume_Ratio'] = data['Volume'] / data['Volume_MA']
     else:
         data['Volume_Ratio'] = 1
     
-    # Price momentum
     data['Price_ROC'] = data['Close'].pct_change(10) * 100
-    
-    # Trend detection
     data['Is_Trending'] = is_trending_market(data)
     
-    # BUY CONDITIONS
     buy_conditions = (
         (data['SMA20'] > data['SMA50']) & 
         (data['SMA20'].shift(1) <= data['SMA50'].shift(1)) &
@@ -246,7 +385,6 @@ def generate_enhanced_signals(data):
         (data['Is_Trending'] == True)
     )
     
-    # SELL CONDITIONS
     sell_conditions = (
         (data['SMA20'] < data['SMA50']) & 
         (data['SMA20'].shift(1) >= data['SMA50'].shift(1)) &
@@ -266,26 +404,23 @@ def calculate_confidence_score(forecast_data, signal_type):
     score = 0
     max_score = 0
     
-    # Days to crossover scoring
     max_score += 20
     days = abs(forecast_data['days_to_crossover'])
     if 3 <= days <= 8: score += 20
     elif 2 <= days <= 10: score += 15
     elif days <= 12: score += 10
     
-    # RSI scoring
     max_score += 15
     rsi = forecast_data['rsi']
     if signal_type == 'BUY':
         if 30 <= rsi <= 50: score += 15
         elif 50 < rsi <= 60: score += 10
         elif 25 <= rsi < 30 or 60 < rsi <= 65: score += 7
-    else:  # SELL
+    else:
         if 50 <= rsi <= 70: score += 15
         elif 40 <= rsi < 50: score += 10
         elif 70 < rsi <= 75 or 35 <= rsi < 40: score += 7
     
-    # MACD alignment scoring
     max_score += 20
     macd_hist = forecast_data['macd_histogram']
     macd_slope = forecast_data['macd_slope']
@@ -293,12 +428,11 @@ def calculate_confidence_score(forecast_data, signal_type):
         if macd_hist > -0.05 and macd_slope > 0.01: score += 20
         elif macd_hist > -0.1 and macd_slope > 0: score += 12
         elif macd_hist > -0.2: score += 6
-    else:  # SELL
+    else:
         if macd_hist < 0.05 and macd_slope < -0.01: score += 20
         elif macd_hist < 0.1 and macd_slope < 0: score += 12
         elif macd_hist < 0.2: score += 6
     
-    # Volume trend scoring
     max_score += 15
     vol_trend = forecast_data['volume_trend']
     if vol_trend > 15: score += 15
@@ -306,7 +440,6 @@ def calculate_confidence_score(forecast_data, signal_type):
     elif vol_trend > 0: score += 5
     elif vol_trend > -10: score += 3
     
-    # Convergence rate scoring
     max_score += 15
     conv_rate = forecast_data['convergence_rate']
     if conv_rate > 0.03: score += 15
@@ -314,14 +447,13 @@ def calculate_confidence_score(forecast_data, signal_type):
     elif conv_rate > 0.01: score += 7
     elif conv_rate > 0.005: score += 4
     
-    # Price momentum scoring
     max_score += 15
     price_roc = forecast_data['price_roc']
     if signal_type == 'BUY':
         if -3 <= price_roc <= 2: score += 15
         elif -5 <= price_roc <= 5: score += 10
         elif -8 <= price_roc <= 8: score += 5
-    else:  # SELL
+    else:
         if -2 <= price_roc <= 3: score += 15
         elif -5 <= price_roc <= 5: score += 10
         elif -8 <= price_roc <= 8: score += 5
@@ -423,7 +555,6 @@ def calculate_signal_confidence(data, signal_index):
     price_roc = data['Price_ROC'].iloc[signal_index]
     volume_ratio = data['Volume_Ratio'].iloc[signal_index] if 'Volume_Ratio' in data.columns else 1
     
-    # Gap size at crossover
     max_score += 20
     gap_pct = abs((sma20 - sma50) / current_price) * 100
     if gap_pct < 0.3: score += 20
@@ -431,42 +562,38 @@ def calculate_signal_confidence(data, signal_index):
     elif gap_pct < 1.5: score += 10
     elif gap_pct < 2.5: score += 5
     
-    # RSI positioning
     max_score += 25
-    if signal_type == 2:  # BUY
+    if signal_type == 2:
         if 35 <= rsi <= 55: score += 25
         elif 30 <= rsi <= 60: score += 18
         elif 25 <= rsi <= 65: score += 10
-    else:  # SELL
+    else:
         if 45 <= rsi <= 65: score += 25
         elif 40 <= rsi <= 70: score += 18
         elif 35 <= rsi <= 75: score += 10
     
-    # MACD alignment
     max_score += 20
-    if signal_type == 2:  # BUY
+    if signal_type == 2:
         if macd_hist > 0: score += 20
         elif macd_hist > -0.3: score += 12
         elif macd_hist > -0.8: score += 6
-    else:  # SELL
+    else:
         if macd_hist < 0: score += 20
         elif macd_hist < 0.3: score += 12
         elif macd_hist < 0.8: score += 6
     
-    # Volume strength
     max_score += 15
     if volume_ratio > 1.5: score += 15
     elif volume_ratio > 1.2: score += 12
     elif volume_ratio > 0.9: score += 8
     elif volume_ratio > 0.7: score += 4
     
-    # Momentum alignment
     max_score += 20
-    if signal_type == 2:  # BUY
+    if signal_type == 2:
         if price_roc > 2: score += 20
         elif price_roc > 0: score += 15
         elif price_roc > -3: score += 8
-    else:  # SELL
+    else:
         if price_roc < -2: score += 20
         elif price_roc < 0: score += 15
         elif price_roc < 3: score += 8
@@ -530,7 +657,7 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
     data, fetch_log = get_stock_data_with_caching(ticker)
     if data.empty:
         st.error(f"ERROR: No data found for ticker '{ticker}'")
-        return None, "", ""
+        return None, "", "", pd.DataFrame()
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
@@ -574,35 +701,43 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
                     forecast_accuracy['sell']['correct'] += 1
                 forecast_accuracy['sell']['total'] += 1
 
-    # Performance simulation
-    initial_capital = 10000.00
-    cash, shares, cost_basis, transaction_log, portfolio_values = initial_capital, 0, 0, [], []
-    first_price_bh = data['Close'].dropna().iloc[0]
-    data['Buy and Hold'] = (initial_capital / first_price_bh) * data['Close']
-    first_valid_index = data.dropna(subset=['SMA50', 'SMA200']).index.get_loc(data.dropna(subset=['SMA50', 'SMA200']).index[0])
-
-    for i in range(len(data)):
-        current_price = data['Close'].iloc[i]
-        if i == first_valid_index and shares == 0 and (data['SMA50'].iloc[i] > data['SMA200'].iloc[i]):
-            signal_type, signal_code = "Initial Buy", 2
-        else:
-            signal_type, signal_code = None, data['Signal'].iloc[i]
-
-        if signal_code == -2 and shares > 0:
-            sale_value = shares * current_price
-            gain_loss = sale_value - cost_basis
-            transaction_log.append({"Date": data.index[i], "Signal": "Sell", "Price": current_price, 
-                                   "Amount": sale_value, "Profit": gain_loss})
-            cash, shares, cost_basis = sale_value, 0, 0
-        elif signal_code == 2 and cash > 0:
-            purchase_value = cash
-            transaction_log.append({"Date": data.index[i], "Signal": signal_type if signal_type else "Buy", 
-                                   "Price": current_price, "Amount": purchase_value, "Profit": 0})
-            shares, cost_basis, cash = cash / current_price, purchase_value, 0
-        
-        portfolio_values.append(cash + (shares * current_price))
+    # Build signals table
+    signals_table_data = []
     
-    data['Strategy Value'] = portfolio_values
+    # Add actual signals
+    actual_signals = data[data['Signal'] != 0].copy()
+    for idx in actual_signals.index:
+        signal_type = "Buy" if actual_signals.loc[idx, 'Signal'] == 2 else "Sell"
+        signals_table_data.append({
+            'Date': idx.strftime('%Y-%m-%d'),
+            'Type': signal_type,
+            'Price': f"${actual_signals.loc[idx, 'Close']:.2f}",
+            'Signal_Sort': 1 if signal_type == "Buy" else 2
+        })
+    
+    # Add forecast signals
+    forecast_buys = data[data['Forecast_Buy'] == True].copy()
+    for idx in forecast_buys.index:
+        signals_table_data.append({
+            'Date': idx.strftime('%Y-%m-%d'),
+            'Type': 'Buy (Prediction)',
+            'Price': f"${forecast_buys.loc[idx, 'Close']:.2f}",
+            'Signal_Sort': 3
+        })
+    
+    forecast_sells = data[data['Forecast_Sell'] == True].copy()
+    for idx in forecast_sells.index:
+        signals_table_data.append({
+            'Date': idx.strftime('%Y-%m-%d'),
+            'Type': 'Sell (Prediction)',
+            'Price': f"${forecast_sells.loc[idx, 'Close']:.2f}",
+            'Signal_Sort': 4
+        })
+    
+    signals_df = pd.DataFrame(signals_table_data)
+    if not signals_df.empty:
+        signals_df = signals_df.sort_values('Date', ascending=False)
+    
     forecast_data = calculate_forecast_metrics(data)
     
     # Prophet forecast
@@ -638,23 +773,13 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
                 sell_acc = (forecast_accuracy['sell']['correct'] / forecast_accuracy['sell']['total']) * 100
                 forecast_summary += f"Sell: {forecast_accuracy['sell']['correct']}/{forecast_accuracy['sell']['total']} ({sell_acc:.1f}%)"
 
-    final_strategy_value = data['Strategy Value'].iloc[-1]
-    final_bh_value = data['Buy and Hold'].iloc[-1]
-    strategy_return = ((final_strategy_value - initial_capital) / initial_capital) * 100
-    bh_return = ((final_bh_value - initial_capital) / initial_capital) * 100
-    
-    performance_summary = (
-        f"Strategy Final Value: ${final_strategy_value:,.2f} ({strategy_return:+.2f}%)\n"
-        f"Buy & Hold Final Value: ${final_bh_value:,.2f} ({bh_return:+.2f}%)\n"
-        f"Outperformance: {strategy_return - bh_return:+.2f}%\n"
-        f"Total Transactions: {len(transaction_log)}"
-    )
+    performance_summary = ""
 
-    # Create 3-row chart
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
-                        row_heights=[0.50, 0.25, 0.25],
-                        specs=[[{"type": "scatter"}], [{"type": "scatter"}], [{"type": "table"}]],
-                        subplot_titles=(f'{ticker} Price Chart', 'Portfolio Value ($10,000 Initial Investment)', 'Recent Transactions'))
+    # Create 2-row chart (removed portfolio value row)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
+                        row_heights=[0.70, 0.30],
+                        specs=[[{"type": "scatter"}], [{"type": "table"}]],
+                        subplot_titles=(f'{ticker} Price Chart', 'Signals'))
 
     # Row 1: Price chart
     if forecast_daily is not None:
@@ -719,52 +844,48 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
                             marker=dict(symbol='triangle-down', color='red', size=13), 
                             name='Sell Signal', legendrank=2), row=1, col=1)
 
-    # Row 2: Portfolio performance
-    fig.add_trace(go.Scatter(x=data.index, y=data['Buy and Hold'], mode='lines',
-                            line=dict(color='gray', width=2), name='Buy & Hold', legendrank=5), row=2, col=1)
-    fig.add_trace(go.Scatter(x=data.index, y=data['Strategy Value'], mode='lines',
-                            line=dict(color='blue', width=2.5), name='MA Strategy', legendrank=6), row=2, col=1)
-    fig.add_hline(y=initial_capital, line=dict(color='red', dash='dash', width=1), 
-                  annotation_text=f"Initial ${initial_capital:,.0f}", row=2, col=1)
-
-    # Row 3: Transaction table
-    if transaction_log:
-        log_df = pd.DataFrame(transaction_log).tail(20)
+    # Row 2: Signals table
+    if not signals_df.empty:
+        table_df = signals_df[['Date', 'Type', 'Price']].tail(30)
         fig.add_trace(go.Table(
-            header=dict(values=['Date', 'Signal', 'Price', 'Amount', 'Profit'], 
-                       font=dict(size=11), align="left", fill_color='lightgray'),
-            cells=dict(values=[log_df['Date'].dt.strftime('%Y-%m-%d'), log_df['Signal'], 
-                              log_df['Price'].map('${:,.2f}'.format), 
-                              log_df['Amount'].map('${:,.2f}'.format), 
-                              log_df['Profit'].apply(lambda x: f"${x:,.2f}" if x != 0 else "-")], 
-                      font=dict(size=10), align="left", height=20)
-        ), row=3, col=1)
+            header=dict(values=['Date', 'Signal Type', 'Price'], 
+                       font=dict(size=12), align="left", fill_color='lightgray'),
+            cells=dict(values=[table_df['Date'], table_df['Type'], table_df['Price']], 
+                      font=dict(size=11), align="left", height=25)
+        ), row=2, col=1)
     
     chart_title = f'{ticker} Analysis'
     fig.update_layout(
-        title=dict(text=chart_title, x=0.5, xanchor='center', font=dict(size=13)),
+        title=dict(text=chart_title, x=0.5, xanchor='center', font=dict(size=14)),
         legend=dict(orientation="v", yanchor="top", y=0.99, xanchor="right", x=0.99, 
-                    bgcolor='rgba(255, 255, 255, 0.7)', bordercolor='gray', borderwidth=1, font=dict(size=9)),
+                    bgcolor='rgba(255, 255, 255, 0.7)', bordercolor='gray', borderwidth=1, font=dict(size=10)),
         hovermode="x unified",
         xaxis_rangeslider_visible=False,
         yaxis1_title="Price (USD)",
-        yaxis2_title="Portfolio Value (USD)",
-        dragmode='zoom',
-        height=1000
+        dragmode='pan',
+        height=900
     )
-    fig.update_xaxes(rangeselector=dict(buttons=list([
-        dict(count=1, label="1m", step="month", stepmode="backward"),
-        dict(count=3, label="3m", step="month", stepmode="backward"),
-        dict(count=6, label="6m", step="month", stepmode="backward"),
-        dict(count=1, label="YTD", step="year", stepmode="todate"),
-        dict(count=1, label="1y", step="year", stepmode="backward"),
-        dict(count=2, label="2y", step="year", stepmode="backward"),
-        dict(count=5, label="5y", step="year", stepmode="backward"),
-        dict(step="all", label="All")
-    ]), bgcolor="rgba(255, 255, 255, 0.8)", activecolor="lightblue",
-       x=0.01, y=1.04, xanchor='left', yanchor='top', font=dict(size=9)), row=1, col=1)
     
-    return fig, performance_summary, forecast_summary
+    # Enable mobile-friendly zoom and pan
+    fig.update_xaxes(
+        fixedrange=False,
+        rangeselector=dict(
+            buttons=list([
+                dict(count=1, label="1m", step="month", stepmode="backward"),
+                dict(count=3, label="3m", step="month", stepmode="backward"),
+                dict(count=6, label="6m", step="month", stepmode="backward"),
+                dict(count=1, label="1y", step="year", stepmode="backward"),
+                dict(step="all", label="All")
+            ]),
+            bgcolor="rgba(255, 255, 255, 0.8)",
+            activecolor="lightblue",
+            x=0.01, y=1.02, xanchor='left', yanchor='top', font=dict(size=10)
+        ),
+        row=1, col=1
+    )
+    fig.update_yaxes(fixedrange=False, row=1, col=1)
+    
+    return fig, performance_summary, forecast_summary, signals_df
 
 
 def process_all_tickers_mod(ticker_list, logger_callback):
@@ -809,7 +930,6 @@ def process_all_tickers_mod(ticker_list, logger_callback):
             store_signals_in_db(ticker, signals_to_store)
             logger_callback(f"Stored {len(signals_to_store)} signals for {ticker}")
     
-    # Export latest signals
     logger_callback("\n--- Exporting Latest Signals ---")
     engine = get_db_connection()
     latest_signals_df = pd.DataFrame()
@@ -876,7 +996,6 @@ def forecast_mode_mod(ticker_list, logger_callback):
         
         forecast_df = pd.DataFrame(forecasts)
         
-        # Sort by priority
         priority_order = {'STRONG_BUY_FORECAST': 1, 'STRONG_SELL_FORECAST': 2, 'BUY_FORECAST': 3, 'SELL_FORECAST': 4}
         forecast_df['priority'] = forecast_df['signal'].map(priority_order)
         forecast_df = forecast_df.sort_values(['priority', 'confidence'], ascending=[True, False])
@@ -902,13 +1021,34 @@ def forecast_mode_mod(ticker_list, logger_callback):
         return pd.DataFrame()
 
 
+# --- Streamlit UI ---
 
+# Admin Mode Toggle
+col_admin, col_spacer = st.sidebar.columns([1, 2])
+with col_admin:
+    if st.button("🔐 Admin" if not st.session_state.admin_mode else "🔓 Admin"):
+        if not st.session_state.admin_mode:
+            password = st.text_input("Enter Password:", type="password", key="admin_password")
+            if password == "dhruv10":
+                st.session_state.admin_mode = True
+                st.rerun()
+            elif password:
+                st.error("Incorrect password")
+        else:
+            st.session_state.admin_mode = False
+            st.rerun()
+
+if st.session_state.admin_mode:
+    st.sidebar.success("Admin Mode Active")
 
 st.sidebar.title("TickSignals")
-app_mode = st.sidebar.radio(
-    "Tabs",
-    ["Ticker Analyzer", "Forecast Signals History", "Trade Signals History"]
-)
+
+# Build tab list
+tab_list = ["Ticker Analyzer", "Forecast Signals History", "Trade Signals History"]
+if st.session_state.admin_mode:
+    tab_list.append("Analytics Dashboard")
+
+app_mode = st.sidebar.radio("Tabs", tab_list)
 
 if app_mode == "Ticker Analyzer":
     st.title("Ticker Analyzer")
@@ -923,6 +1063,9 @@ if app_mode == "Ticker Analyzer":
             if not ticker_input:
                 st.warning("Please enter a ticker symbol.")
             else:
+                # Log the ticker search
+                log_ticker_search(ticker_input)
+                
                 with st.spinner(f"Analyzing {ticker_input}..."):
                     
                     # Display Stock Info Metrics
@@ -934,16 +1077,17 @@ if app_mode == "Ticker Analyzer":
                     col4.metric("P/E Ratio", stock_info["P/E Ratio"])
                     
                     # Generate and Display Chart
-                    fig, perf_summary, forecast_summary = generate_chart_for_ticker_mod(ticker_input, show_forecast=True)
+                    fig, perf_summary, forecast_summary, signals_df = generate_chart_for_ticker_mod(ticker_input, show_forecast=True)
                     
                     if fig:
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True, config={
+                            'scrollZoom': True,
+                            'displayModeBar': True,
+                            'modeBarButtonsToRemove': ['lasso2d', 'select2d'],
+                            'displaylogo': False
+                        })
                         
-                        col_perf, col_forecast = st.columns(2)
-                        with col_perf:
-                            st.subheader("Performance Summary")
-                            st.text(perf_summary)
-                        with col_forecast:
+                        if forecast_summary and forecast_summary != "No active forecast.":
                             st.subheader("Forecast Analysis")
                             st.text(forecast_summary)
                     else:
@@ -953,7 +1097,7 @@ if app_mode == "Ticker Analyzer":
         st.header("Mass Run - All Tickers")
         st.write("Process a list of tickers to generate and store trade signals.")
         
-        uploaded_file = st.file_uploader("Upload Ticker CSV (Optional, uses 'vanguard.csv' if not provided)", type="csv")
+        uploaded_file = st.file_uploader("Upload Ticker CSV (Optional, uses Vanguard ETF 1500 if not provided)", type="csv")
         
         if st.button("Run Mass Signal Analysis"):
             ticker_list = []
@@ -968,7 +1112,7 @@ if app_mode == "Ticker Analyzer":
                 try:
                     ticker_df = pd.read_csv('vanguard.csv')
                     ticker_list = ticker_df.iloc[:, 0].tolist()
-                    st.info(f"Using {len(ticker_list)} tickers from default 'vanguard.csv'.")
+                    st.info(f"Using {len(ticker_list)} tickers from Vanguard ETF 1500.")
                 except FileNotFoundError:
                     st.error("Default 'vanguard.csv' not found. Please upload a ticker file.")
             
@@ -979,7 +1123,7 @@ if app_mode == "Ticker Analyzer":
                 def mass_logger(message):
                     log_area.info(message)
 
-                with st.spinner("Processing all tickers... This may take a moment."):
+                with st.spinner("Processing all tickers"):
                     latest_signals_df = process_all_tickers_mod(ticker_list, mass_logger)
                 
                 st.success("Mass Run Complete!")
@@ -993,7 +1137,7 @@ if app_mode == "Ticker Analyzer":
                 )
 
     with forecast_tab:
-        st.header("Predictive Forecast Run")
+        st.header("Prediction Forecast Run")
         st.write("Analyze all tickers for potential *upcoming* buy/sell signals.")
         
         uploaded_file_forecast = st.file_uploader("Upload Ticker CSV (Optional, uses Vanguard ETF 1500 if not provided)", type="csv", key="forecast_uploader")
@@ -1022,7 +1166,7 @@ if app_mode == "Ticker Analyzer":
                 def forecast_logger(message):
                     log_area_forecast.info(message)
                 
-                with st.spinner("Running forecast analysis... This may take a long time."):
+                with st.spinner("Running forecast analysis... This may take a while"):
                     forecast_df = forecast_mode_mod(ticker_list_forecast, forecast_logger)
                 
                 st.success("Forecast Run Complete!")
@@ -1051,7 +1195,7 @@ elif app_mode == "Forecast Signals History":
         else:
             st.warning("No forecast data found. Please run a 'Forecast Run' from the 'Analyzer' tab.")
     else:
-        st.warning("No 'forecast_signals.csv' file found. Please run a 'Forecast Run' from the 'Analyzer' tab to generate it.")
+        st.warning("No file found. Please run a 'Forecast Run' from the 'Analyzer' tab")
 
 elif app_mode == "Trade Signals History":
     st.title("Trade Signals History")    
@@ -1069,3 +1213,95 @@ elif app_mode == "Trade Signals History":
             st.warning("No signal data found. Please run a 'Mass Run' from the 'Analyzer' tab.")
     else:
         st.warning("No 'latest_signals.csv' file found. Please run a 'Mass Run' from the 'Analyzer' tab to generate it.")
+
+elif app_mode == "Analytics Dashboard":
+    if not st.session_state.admin_mode:
+        st.error("Access Denied: Admin mode required")
+    else:
+        st.title("Analytics Dashboard")
+        
+        analytics = get_analytics_data()
+        
+        if analytics:
+            # Key Metrics Row
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Total Visits", f"{analytics['total_visits']:,}")
+            with col2:
+                st.metric("Unique Users", f"{analytics['unique_sessions']:,}")
+            with col3:
+                st.metric("Active Now", f"{analytics['active_users']}")
+            with col4:
+                st.metric("Total Searches", f"{analytics['total_searches']:,}")
+            
+            st.divider()
+            
+            # Two column layout
+            col_left, col_right = st.columns(2)
+            
+            with col_left:
+                st.subheader("Most Searched Tickers")
+                if not analytics['popular_tickers'].empty:
+                    st.dataframe(
+                        analytics['popular_tickers'].rename(columns={'ticker': 'Ticker', 'search_count': 'Searches'}),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.info("No search data yet")
+            
+            with col_right:
+                st.subheader("Recent Searches")
+                if not analytics['recent_searches'].empty:
+                    recent_df = analytics['recent_searches'][['ticker', 'timestamp']].copy()
+                    recent_df['timestamp'] = pd.to_datetime(recent_df['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
+                    st.dataframe(
+                        recent_df.rename(columns={'ticker': 'Ticker', 'timestamp': 'Time'}),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.info("No search history yet")
+            
+            st.divider()
+            
+            # Visits over time chart
+            st.subheader("Visits Over Time (Last 30 Days)")
+            if not analytics['visits_over_time'].empty:
+                fig_visits = go.Figure()
+                fig_visits.add_trace(go.Scatter(
+                    x=analytics['visits_over_time']['date'],
+                    y=analytics['visits_over_time']['visits'],
+                    mode='lines+markers',
+                    line=dict(color='#1f77b4', width=3),
+                    marker=dict(size=8),
+                    fill='tozeroy',
+                    fillcolor='rgba(31, 119, 180, 0.2)'
+                ))
+                fig_visits.update_layout(
+                    xaxis_title="Date",
+                    yaxis_title="Number of Visits",
+                    hovermode='x unified',
+                    height=400
+                )
+                st.plotly_chart(fig_visits, use_container_width=True)
+            else:
+                st.info("Not enough data to display trend")
+            
+            st.divider()
+            
+            # Additional Stats
+            st.subheader("Detailed Statistics")
+            col_stat1, col_stat2 = st.columns(2)
+            
+            with col_stat1:
+                avg_searches_per_user = analytics['total_searches'] / max(analytics['unique_sessions'], 1)
+                st.metric("Avg Searches per User", f"{avg_searches_per_user:.1f}")
+            
+            with col_stat2:
+                avg_visits_per_user = analytics['total_visits'] / max(analytics['unique_sessions'], 1)
+                st.metric("Avg Visits per User", f"{avg_visits_per_user:.1f}")
+            
+        else:
+            st.error("Unable to load analytics data")
