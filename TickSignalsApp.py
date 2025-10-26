@@ -1026,7 +1026,7 @@ def forecast_mode_mod(ticker_list, logger_callback):
 # Admin Mode Toggle
 col_admin, col_spacer = st.sidebar.columns([1, 2])
 with col_admin:
-    if st.button("🔐 Admin" if not st.session_state.admin_mode else "🔓 Admin"):
+    if st.button("🔐" if not st.session_state.admin_mode else "🔓"):
         if not st.session_state.admin_mode:
             password = st.text_input("Enter Password:", type="password", key="admin_password")
             if password == "dhruv10":
