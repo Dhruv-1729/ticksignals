@@ -201,10 +201,28 @@ def get_analytics_data():
 
 # Log this page visit
 log_page_visit()
-
-# --- Helper Functions ---
-
 @st.cache_data(ttl=3600)
+def get_forecast_from_db():
+    """Retrieve latest forecast data from database"""
+    engine = get_db_connection()
+    if engine is None:
+        return None
+    
+    try:
+        with engine.connect() as conn:
+            # Get forecasts from last 7 days
+            query = text("""
+                SELECT * FROM forecast_signals 
+                WHERE "Date" >= CURRENT_DATE - INTERVAL '7 days'
+                ORDER BY "Date" DESC, "Confidence_%" DESC
+            """)
+            forecast_df = pd.read_sql_query(query, conn)
+            return forecast_df
+    except Exception as e:
+        st.warning(f"Could not load cached forecasts: {e}")
+        return None
+
+
 def get_stock_data_with_caching(ticker):
     """Fetches stock data using PostgreSQL database for caching."""
     engine = get_db_connection()
@@ -1162,6 +1180,8 @@ if app_mode == "Ticker Analyzer":
         
         if st.button("Run Mass Signal Analysis"):
             ticker_list = []
+            use_default = False
+            
             if uploaded_file is not None:
                 try:
                     ticker_df = pd.read_csv(uploaded_file)
@@ -1170,14 +1190,53 @@ if app_mode == "Ticker Analyzer":
                 except Exception as e:
                     st.error(f"Error reading uploaded file: {e}")
             else:
-                try:
-                    ticker_df = pd.read_csv('vanguard.csv')
-                    ticker_list = ticker_df.iloc[:, 0].tolist()
-                    st.info(f"Using {len(ticker_list)} tickers from Vanguard ETF 1500.")
-                except FileNotFoundError:
-                    st.error("Default 'vanguard.csv' not found. Please upload a ticker file.")
+                # User is using default - try to load from database first
+                use_default = True
+                st.info("Using default vanguard.csv; checking for cached results")
+                
+                # Try to get latest signals from database
+                engine = get_db_connection()
+                latest_signals_df = pd.DataFrame()
+                
+                if engine:
+                    try:
+                        with engine.connect() as conn:
+                            query = text("""
+                                SELECT t1."Date", t1."Ticker", t1."Signal", t1."Price", t1."Confidence_Pct" as "Confidence_%"
+                                FROM all_signals t1
+                                INNER JOIN (
+                                    SELECT "Ticker", MAX("Date") as "MaxDate"
+                                    FROM all_signals
+                                    GROUP BY "Ticker"
+                                ) t2 ON t1."Ticker" = t2."Ticker" AND t1."Date" = t2."MaxDate"
+                                WHERE t1."Date" >= CURRENT_DATE - INTERVAL '7 days'
+                                ORDER BY t1."Confidence_Pct" DESC, t1."Date" DESC
+                            """)
+                            latest_signals_df = pd.read_sql_query(query, conn)
+                    except Exception as e:
+                        st.warning(f"Could not load cached signals: {e}")
+                
+                if not latest_signals_df.empty:
+                    st.success(f"Loaded {len(latest_signals_df)} cached trade signals from database!")
+                    st.dataframe(latest_signals_df)
+                    
+                    st.download_button(
+                        label="Download signals",
+                        data=latest_signals_df.to_csv(index=False).encode('utf-8'),
+                        file_name="latest_signals.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.warning("No cached signals found. Running fresh analysis...")
+                    try:
+                        ticker_df = pd.read_csv('vanguard.csv')
+                        ticker_list = ticker_df.iloc[:, 0].tolist()
+                        st.info(f"Using {len(ticker_list)} tickers from Vanguard ETF 1500.")
+                    except FileNotFoundError:
+                        st.error("Default 'vanguard.csv' not found. Please upload a ticker file.")
             
-            if ticker_list:
+            if ticker_list and not use_default:
+                # Only run fresh analysis if custom file uploaded
                 st.subheader("Processing Log")
                 log_area = st.container(height=300)
                 
@@ -1203,42 +1262,62 @@ if app_mode == "Ticker Analyzer":
         
         uploaded_file_forecast = st.file_uploader("Upload Ticker CSV (Optional, uses Vanguard ETF 1500 if not provided)", type="csv", key="forecast_uploader")
 
-        if st.button("Run Forecast Analysis"):
-            ticker_list_forecast = []
-            if uploaded_file_forecast is not None:
-                try:
-                    ticker_df = pd.read_csv(uploaded_file_forecast)
-                    ticker_list_forecast = ticker_df.iloc[:, 0].tolist()
-                    st.info(f"Using {len(ticker_list_forecast)} tickers from uploaded file.")
-                except Exception as e:
-                    st.error(f"Error reading uploaded file: {e}")
-            else:
-                try:
-                    ticker_df = pd.read_csv('vanguard.csv')
-                    ticker_list_forecast = ticker_df.iloc[:, 0].tolist()
-                    st.info(f"Using {len(ticker_list_forecast)} tickers from default 'vanguard.csv'.")
-                except FileNotFoundError:
-                    st.error("Default 'vanguard.csv' not found. Please upload a ticker file.")
+if st.button("Run Forecast Analysis"):
+    ticker_list_forecast = []
+    use_default = False
+    
+    if uploaded_file_forecast is not None:
+        try:
+            ticker_df = pd.read_csv(uploaded_file_forecast)
+            ticker_list_forecast = ticker_df.iloc[:, 0].tolist()
+            st.info(f"Using {len(ticker_list_forecast)} tickers from uploaded file.")
+        except Exception as e:
+            st.error(f"Error reading uploaded file: {e}")
+    else:
+        # User is using default - try to load from database first
+        use_default = True
+        st.info("Using default vanguard.csv; checking for cached results")
+        
+        cached_forecast = get_forecast_from_db()
+        
+        if cached_forecast is not None and not cached_forecast.empty:
+            st.success(f"Loaded {len(cached_forecast)} cached forecast signals from database!")
+            st.dataframe(cached_forecast)
+            
+            st.download_button(
+                label="Download cached forecast",
+                data=cached_forecast.to_csv(index=False).encode('utf-8'),
+                file_name="forecast_signals.csv",
+                mime="text/csv"
+            )
+        else:
+            st.warning("No cached forecasts found. Running fresh analysis...")
+            try:
+                ticker_df = pd.read_csv('vanguard.csv')
+                ticker_list_forecast = ticker_df.iloc[:, 0].tolist()
+            except FileNotFoundError:
+                st.error("Default 'vanguard.csv' not found. Please upload a ticker file.")
 
-            if ticker_list_forecast:
-                st.subheader("Processing Log")
-                log_area_forecast = st.container(height=300)
+    if ticker_list_forecast and not use_default:
+        # Only run fresh analysis if custom file uploaded
+        st.subheader("Processing Log")
+        log_area_forecast = st.container(height=300)
 
-                def forecast_logger(message):
-                    log_area_forecast.info(message)
-                
-                with st.spinner("Running forecast analysis... This may take a while"):
-                    forecast_df = forecast_mode_mod(ticker_list_forecast, forecast_logger)
-                
-                st.success("Forecast Run Complete!")
-                st.dataframe(forecast_df)
+        def forecast_logger(message):
+            log_area_forecast.info(message)
+        
+        with st.spinner("Running forecast analysis... This may take a while"):
+            forecast_df = forecast_mode_mod(ticker_list_forecast, forecast_logger)
+        
+        st.success("Forecast Run Complete!")
+        st.dataframe(forecast_df)
 
-                st.download_button(
-                    label="Download forecast_signals.csv",
-                    data=forecast_df.to_csv(index=False).encode('utf-8'),
-                    file_name="forecast_signals.csv",
-                    mime="text/csv"
-                )
+        st.download_button(
+            label="Download forecast_signals.csv",
+            data=forecast_df.to_csv(index=False).encode('utf-8'),
+            file_name="forecast_signals.csv",
+            mime="text/csv"
+        )
 
 elif app_mode == "Forecast Signals History":
     st.title("Forecast Signals History")
