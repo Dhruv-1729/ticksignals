@@ -1269,7 +1269,7 @@ if app_mode == "Ticker Analyzer":
                 cached_forecast = get_forecast_from_db()
                 
                 if cached_forecast is not None and not cached_forecast.empty:
-                    st.success(f"Loaded {len(latest_signals_df)} forecast signals!")
+                    st.success(f"Loaded {len(cached_forecast)} forecast signals!")
                     st.dataframe(cached_forecast)
                     
                 else:
