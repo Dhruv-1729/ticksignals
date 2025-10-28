@@ -1192,7 +1192,7 @@ if app_mode == "Ticker Analyzer":
             else:
                 # User is using default - try to load from database first
                 use_default = True
-                st.info("Using default vanguard.csv; checking for cached results")
+                st.info("Using default vanguard.csv")
                 
                 # Try to get latest signals from database
                 engine = get_db_connection()
@@ -1217,15 +1217,9 @@ if app_mode == "Ticker Analyzer":
                         st.warning(f"Could not load cached signals: {e}")
                 
                 if not latest_signals_df.empty:
-                    st.success(f"Loaded {len(latest_signals_df)} cached trade signals from database!")
+                    st.success(f"Loaded {len(latest_signals_df)} trade signals!")
                     st.dataframe(latest_signals_df)
                     
-                    st.download_button(
-                        label="Download signals",
-                        data=latest_signals_df.to_csv(index=False).encode('utf-8'),
-                        file_name="latest_signals.csv",
-                        mime="text/csv"
-                    )
                 else:
                     st.warning("No cached signals found. Running fresh analysis...")
                     try:
@@ -1249,12 +1243,6 @@ if app_mode == "Ticker Analyzer":
                 st.success("Mass Run Complete!")
                 st.dataframe(latest_signals_df)
                 
-                st.download_button(
-                    label="Download latest_signals.csv",
-                    data=latest_signals_df.to_csv(index=False).encode('utf-8'),
-                    file_name="latest_signals.csv",
-                    mime="text/csv"
-                )
 
     with forecast_tab:
         st.header("Prediction Forecast Run")
@@ -1276,22 +1264,16 @@ if app_mode == "Ticker Analyzer":
             else:
                 # User is using default - try to load from database first
                 use_default = True
-                st.info("Using default vanguard.csv; checking for cached results")
+                st.info("Using default vanguard.csv")
                 
                 cached_forecast = get_forecast_from_db()
                 
                 if cached_forecast is not None and not cached_forecast.empty:
-                    st.success(f"Loaded {len(cached_forecast)} cached forecast signals from database!")
+                    st.success(f"Loaded {len(latest_signals_df)} forecast signals!")
                     st.dataframe(cached_forecast)
                     
-                    st.download_button(
-                        label="Download cached forecast",
-                        data=cached_forecast.to_csv(index=False).encode('utf-8'),
-                        file_name="forecast_signals.csv",
-                        mime="text/csv"
-                    )
                 else:
-                    st.warning("No cached forecasts found. Running fresh analysis...")
+                    st.warning("Custom file. Running fresh analysis")
                     try:
                         ticker_df = pd.read_csv('vanguard.csv')
                         ticker_list_forecast = ticker_df.iloc[:, 0].tolist()
@@ -1312,12 +1294,6 @@ if app_mode == "Ticker Analyzer":
                 st.success("Forecast Run Complete!")
                 st.dataframe(forecast_df)
 
-                st.download_button(
-                    label="Download forecast_signals.csv",
-                    data=forecast_df.to_csv(index=False).encode('utf-8'),
-                    file_name="forecast_signals.csv",
-                    mime="text/csv"
-                )
 
 elif app_mode == "Forecast Signals History":
     st.title("Forecast Signals History")
