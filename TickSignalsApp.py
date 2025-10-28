@@ -29,7 +29,7 @@ st.session_state.page_visits += 1
 def get_db_connection():
     """Creates a SQLAlchemy engine for PostgreSQL connection"""
     try:
-        db_url = st.secrets["connections"]["postgresql"]["url"]
+        db_url = st.secrets["connections"]["connections.neondb"]["url"]
         engine = create_engine(db_url)
         return engine
     except Exception as e:
@@ -1262,9 +1262,9 @@ if app_mode == "Ticker Analyzer":
         
         uploaded_file_forecast = st.file_uploader("Upload Ticker CSV (Optional, uses Vanguard ETF 1500 if not provided)", type="csv", key="forecast_uploader")
 
-if st.button("Run Forecast Analysis"):
-    ticker_list_forecast = []
-    use_default = False
+    if st.button("Run Forecast Analysis"):
+        ticker_list_forecast = []
+        use_default = False
     
     if uploaded_file_forecast is not None:
         try:
