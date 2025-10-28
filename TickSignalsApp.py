@@ -29,7 +29,7 @@ st.session_state.page_visits += 1
 def get_db_connection():
     """Creates a SQLAlchemy engine for PostgreSQL connection"""
     try:
-        db_url = st.secrets["connections"]["connections.neondb"]["url"]
+        db_url = st.secrets["connections"]["postgresql"]["url"]
         engine = create_engine(db_url)
         return engine
     except Exception as e:
