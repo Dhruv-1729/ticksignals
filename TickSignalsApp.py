@@ -1138,7 +1138,7 @@ if app_mode == "Ticker Analyzer":
         st.header("Single Ticker Analysis")
         ticker_input = st.text_input("Enter Ticker Symbol", "").upper()
         
-        if st.button("Run Analysis"):
+        if st.button("Run Analysis", key="single_ticker_run"):
             if not ticker_input:
                 st.warning("Please enter a ticker symbol.")
             else:
@@ -1178,7 +1178,7 @@ if app_mode == "Ticker Analyzer":
         
         uploaded_file = st.file_uploader("Upload Ticker CSV (Optional, uses Vanguard ETF 1500 if not provided)", type="csv")
         
-        if st.button("Run Mass Signal Analysis"):
+        if st.button("Run Mass Signal Analysis", key="mass_run_button"):
             ticker_list = []
             use_default = False
             
@@ -1262,7 +1262,7 @@ if app_mode == "Ticker Analyzer":
         
         uploaded_file_forecast = st.file_uploader("Upload Ticker CSV (Optional, uses Vanguard ETF 1500 if not provided)", type="csv", key="forecast_uploader")
 
-        if st.button("Run Forecast Analysis"):
+        if st.button("Run Forecast Analysis", key="forecast_run_button"):
             ticker_list_forecast = []
             use_default = False
             
