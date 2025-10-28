@@ -26,20 +26,30 @@ if 'session_id' not in st.session_state:
 st.session_state.page_visits += 1
 
 
-def get_db_connection():
-    """Creates a SQLAlchemy engine for PostgreSQL connection"""
+def get_supabase_connection():
+    """Supabase - for signals, forecasts, and analytics"""
     try:
         db_url = st.secrets["connections"]["postgresql"]["url"]
         engine = create_engine(db_url)
         return engine
     except Exception as e:
-        st.error(f"Database connection error: {e}")
+        st.error(f"Supabase connection error: {e}")
+        return None
+
+def get_neon_connection():
+    """Neon - for stock price data caching"""
+    try:
+        db_url = st.secrets["connections"]["neondb"]["url"]
+        engine = create_engine(db_url)
+        return engine
+    except Exception as e:
+        st.error(f"Neon connection error: {e}")
         return None
 
 
 def log_ticker_search(ticker):
     """Log ticker search to database"""
-    engine = get_db_connection()
+    engine = get_supabase_connection()
     if engine is None:
         return
     
@@ -72,7 +82,7 @@ def log_ticker_search(ticker):
 
 def log_page_visit():
     """Log page visit to database"""
-    engine = get_db_connection()
+    engine = get_supabase_connection()
     if engine is None:
         return
     
@@ -105,7 +115,7 @@ def log_page_visit():
 
 def get_analytics_data():
     """Retrieve analytics data from database"""
-    engine = get_db_connection()
+    engine = get_supabase_connection()
     if engine is None:
         return None
     
@@ -204,7 +214,7 @@ log_page_visit()
 @st.cache_data(ttl=3600)
 def get_forecast_from_db():
     """Retrieve latest forecast data from database"""
-    engine = get_db_connection()
+    engine = get_supabase_connection()
     if engine is None:
         return None
     
@@ -225,7 +235,7 @@ def get_forecast_from_db():
 
 def get_stock_data_with_caching(ticker):
     """Fetches stock data using PostgreSQL database for caching."""
-    engine = get_db_connection()
+    engine = get_neon_connection()
     if engine is None:
         return pd.DataFrame(), ["Database connection failed"]
     
@@ -308,7 +318,7 @@ def get_stock_data_with_caching(ticker):
 
 def store_signals_in_db(ticker, signals_df):
     """Stores newly generated signals in the PostgreSQL database."""
-    engine = get_db_connection()
+    engine = get_supabase_connection()
     if engine is None:
         return
     
@@ -997,7 +1007,7 @@ def process_all_tickers_mod(ticker_list, logger_callback):
             logger_callback(f"Stored {len(signals_to_store)} signals for {ticker}")
     
     logger_callback("\n--- Exporting Latest Signals ---")
-    engine = get_db_connection()
+    engine = get_supabase_connection()
     latest_signals_df = pd.DataFrame()
     
     if engine:
@@ -1195,7 +1205,7 @@ if app_mode == "Ticker Analyzer":
                 st.info("Using default vanguard.csv")
                 
                 # Try to get latest signals from database
-                engine = get_db_connection()
+                engine = get_supabase_connection()
                 latest_signals_df = pd.DataFrame()
                 
                 if engine:
