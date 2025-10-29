@@ -41,6 +41,8 @@ def get_neon_connection():
     try:
         db_url = st.secrets["connections"]["neondb"]["url"]
         engine = create_engine(db_url)
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
         return engine
     except Exception as e:
         st.error(f"Neon connection error: {e}")
@@ -241,80 +243,103 @@ def get_stock_data_with_caching(ticker):
     
     sanitized_ticker = re.sub(r'[^a-zA-Z0-9_]', '', ticker).lower()
     table_name = f"stock_{sanitized_ticker}"
-    
     fetch_log = []
     
+    old_data = pd.DataFrame()
+    start_date = "2010-01-01"
+
     try:
         with engine.connect() as conn:
-            check_table = text(f"""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_name = :table_name
+            # First, create the table if it doesn't exist
+            create_table = text(f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    "Date" DATE PRIMARY KEY,
+                    "Open" FLOAT,
+                    "High" FLOAT,
+                    "Low" FLOAT,
+                    "Close" FLOAT,
+                    "Volume" BIGINT
                 )
             """)
-            table_exists = conn.execute(check_table, {"table_name": table_name}).scalar()
+            conn.execute(create_table)
+            conn.commit()
+
+            # Now, try to read all existing data
+            query = text(f'SELECT * FROM {table_name} ORDER BY "Date"')
+            old_data = pd.read_sql_query(query, conn)
             
-            if table_exists:
-                last_date_query = text(f'SELECT MAX("Date") FROM {table_name}')
-                last_date_str = conn.execute(last_date_query).scalar()
+            if not old_data.empty:
+                old_data['Date'] = pd.to_datetime(old_data['Date'])
+                old_data = old_data.set_index('Date')
                 
-                if last_date_str:
-                    start_date = (pd.to_datetime(last_date_str) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-                else:
-                    start_date = "2010-01-01"
+                # If we have data, set the start date to fetch only new data
+                last_date_str = old_data.index.max()
+                start_date = (pd.to_datetime(last_date_str) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+                fetch_log.append(f"Found cached data up to {last_date_str.strftime('%Y-%m-%d')}")
             else:
-                start_date = "2010-01-01"
-                create_table = text(f"""
-                    CREATE TABLE IF NOT EXISTS {table_name} (
-                        "Date" DATE PRIMARY KEY,
-                        "Open" FLOAT,
-                        "High" FLOAT,
-                        "Low" FLOAT,
-                        "Close" FLOAT,
-                        "Volume" BIGINT
-                    )
-                """)
-                conn.execute(create_table)
-                conn.commit()
+                fetch_log.append("No cached data found.")
+                
     except Exception as e:
-        fetch_log.append(f"Error checking existing data: {e}")
-        start_date = "2010-01-01"
+        fetch_log.append(f"Error reading existing data: {e}")
+        # Proceed with default start_date
     
+    new_data = pd.DataFrame()
     if start_date <= datetime.now().strftime('%Y-%m-%d'):
         fetch_log.append(f"Fetching new data for {ticker} from {start_date}...")
-        new_data = yf.download(ticker, start=start_date, progress=False, auto_adjust=True)
-        
-        if not new_data.empty:
-            if isinstance(new_data.columns, pd.MultiIndex):
-                new_data.columns = new_data.columns.get_level_values(0)
-            new_data.rename(columns=str.capitalize, inplace=True)
-            df_to_write = new_data.reset_index()
-            df_to_write.rename(columns={'index': 'Date'}, inplace=True)
-            
-            try:
-                df_to_write.to_sql(table_name, engine, if_exists='append', index=False)
-                fetch_log.append(f"Added {len(df_to_write)} new records")
-            except Exception as e:
-                fetch_log.append(f"Error writing data: {e}")
-    else:
-        fetch_log.append(f"Data for {ticker} is up to date.")
-    
-    try:
-        with engine.connect() as conn:
-            query = text(f'SELECT * FROM {table_name} ORDER BY "Date"')
-            data = pd.read_sql_query(query, conn)
-            
-            if 'Date' in data.columns:
-                data['Date'] = pd.to_datetime(data['Date'])
-                data = data.set_index('Date')
-            else:
+        try:
+            new_data = yf.download(ticker, start=start_date, progress=False, auto_adjust=True)
+            if new_data.empty and start_date == "2010-01-01":
+                fetch_log.append(f"yf.download returned no data for {ticker}. Check if ticker is valid.")
+                st.error(f"Could not fetch data for {ticker}. Verify ticker symbol is correct.")
                 return pd.DataFrame(), fetch_log
+            elif not new_data.empty:
+                # Prepare new data for database
+                if isinstance(new_data.columns, pd.MultiIndex):
+                    new_data.columns = new_data.columns.get_level_values(0)
                 
-    except Exception as e:
-        fetch_log.append(f"Error reading data: {e}")
-        data = pd.DataFrame()
-    
-    return data, fetch_log
+                # Ensure yfinance data index is datetime before processing
+                new_data.index = pd.to_datetime(new_data.index)
+
+                new_data_renamed = new_data.copy()
+                new_data_renamed.rename(columns=str.capitalize, inplace=True)
+                df_to_write = new_data_renamed.reset_index()
+                df_to_write.rename(columns={'index': 'Date'}, inplace=True)
+                
+                # Convert Date column to simple date (without time) for database
+                df_to_write['Date'] = df_to_write['Date'].dt.date
+                
+                try:
+                    # Try to write the new data to the cache
+                    df_to_write.to_sql(table_name, engine, if_exists='append', index=False)
+                    fetch_log.append(f"Added {len(df_to_write)} new records to cache.")
+                except Exception as e:
+                    fetch_log.append(f"Error writing new data to cache: {e}")
+                    # CRITICAL: Don't stop. We can still show the chart.
+            
+        except Exception as e:
+             fetch_log.append(f"Error during yf.download: {e}")
+
+    # Combine old data (from DB) and new data (from yfinance)
+    if not new_data.empty:
+        # yfinance index is datetime, ensure old_data index is also datetime for combine
+        old_data.index = pd.to_datetime(old_data.index)
+        
+        # We use combine_first to avoid duplicates if yf.download re-fetched a day
+        combined_data = new_data.combine_first(old_data)
+        
+        # Ensure 'Close' column is present, which is needed for signals
+        if 'Close' not in combined_data.columns and 'close' in combined_data.columns:
+             combined_data['Close'] = combined_data['close']
+        
+        combined_data.sort_index(inplace=True)
+        return combined_data, fetch_log
+    elif not old_data.empty:
+        # No new data was fetched, just return the old data from DB
+        fetch_log.append("Returning up-to-date cached data.")
+        return old_data, fetch_log
+    else:
+        # Both DB and yfinance returned nothing
+        return pd.DataFrame(), fetch_log
 
 def store_signals_in_db(ticker, signals_df):
     """Stores newly generated signals in the PostgreSQL database."""
@@ -709,6 +734,10 @@ def generate_chart_for_ticker_mod(ticker, show_forecast=False):
     data, fetch_log = get_stock_data_with_caching(ticker)
     if data.empty:
         st.error(f"ERROR: No data found for ticker '{ticker}'")
+        if fetch_log:
+            with st.expander("Fetch Details"):
+                for log in fetch_log:
+                    st.write(log)
         return None, "", "", pd.DataFrame()
 
     if isinstance(data.columns, pd.MultiIndex):
@@ -1013,6 +1042,18 @@ def process_all_tickers_mod(ticker_list, logger_callback):
     if engine:
         try:
             with engine.connect() as conn:
+                create_table = text("""
+                    CREATE TABLE IF NOT EXISTS all_signals (
+                        "Date" DATE,
+                        "Ticker" TEXT,
+                        "Signal" TEXT,
+                        "Price" FLOAT,
+                        "Confidence_Pct" INTEGER,
+                        PRIMARY KEY ("Date", "Ticker")
+                    )
+                """)
+                conn.execute(create_table)
+                conn.commit()
                 query = text("""
                     SELECT t1."Date", t1."Ticker", t1."Signal", t1."Price", t1."Confidence_Pct" as "Confidence_%"
                     FROM all_signals t1
