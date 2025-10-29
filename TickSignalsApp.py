@@ -225,7 +225,7 @@ def get_forecast_from_db():
             # Get forecasts from last 7 days
             query = text("""
                 SELECT * FROM forecast_signals 
-                WHERE "Date" >= CURRENT_DATE - INTERVAL '7 days'
+                WHERE "Date" >= CURRENT_DATE - INTERVAL '365 days'
                 ORDER BY "Date" DESC, "Confidence_%" DESC
             """)
             forecast_df = pd.read_sql_query(query, conn)
